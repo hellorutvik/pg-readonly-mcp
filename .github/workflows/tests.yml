@@ -1,0 +1,18 @@
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The runner image ships PostgreSQL, but initdb/pg_ctl live in a versioned bindir that isn't on PATH.
+      - run: ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1 >> "$GITHUB_PATH"
+      - run: pip install . pytest
+      - run: python -m pytest -q
+        env:
+          PGMCP_REQUIRE_PG: "1"   # fail, don't skip, if the integration tests can't start Postgres

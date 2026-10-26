@@ -69,6 +69,15 @@ def audit(cfg, **event):
         f.write(json.dumps(event, default=str) + "\n")
 
 
+def capped(sql, limit):
+    """Push the row cap into Postgres so it stops early instead of sending the whole result.
+    EXPLAIN can't be a subquery and returns a short plan, so it runs as written."""
+    if first_word(sql) == "explain":
+        return sql
+    body = re.sub(r"[\s;]+$", "", sql)  # a trailing ';' is not valid inside a subquery
+    return f"select * from (\n{body}\n) as pgmcp_q limit {int(limit)}"  # newlines keep a trailing -- comment inside
+
+
 def run_query(cfg, sql, conn=None):
     """Run one read-only statement. Returns columns, rows (masked, capped), truncated flag and timing."""
     started = time.monotonic()
@@ -84,7 +93,7 @@ def run_query(cfg, sql, conn=None):
                     # prepare=True makes the server parse it as one prepared statement, so "select 1; commit; delete ..."
                     # is refused outright. Without it, a parameterless query goes over the simple protocol,
                     # which runs several statements and could step out of the read-only transaction.
-                    cur.execute(sql, prepare=True)
+                    cur.execute(capped(sql, cfg.max_rows + 1), prepare=True)
                     columns = [d.name for d in cur.description or []]
                     rows = cur.fetchmany(cfg.max_rows + 1)
                 finally:
@@ -124,17 +133,23 @@ def list_tables(cfg, conn=None):
 
 
 def describe_table(cfg, name, conn=None):
-    schema, _, table = name.rpartition(".")
     own = conn is None
-    conn = conn or psycopg.connect(cfg.dsn, autocommit=True)
     try:
-        with conn.cursor() as cur:
-            if not cur.execute("select has_table_privilege(%s, 'SELECT')", (name,)).fetchone()[0]:
-                raise Rejected(f"no read access to {name}")
-            cols = cur.execute(DESCRIBE_SQL, (schema or "public", table)).fetchall()
-    finally:
-        if own:
-            conn.close()
+        conn = conn or psycopg.connect(cfg.dsn, autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                # Resolve the name the way Postgres would (search_path, quoting), then describe that exact relation.
+                found = cur.execute("select n.nspname, c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace "
+                                    "where c.oid = to_regclass(%s)", (name,)).fetchone()
+                if not found or not cur.execute("select has_table_privilege(to_regclass(%s), 'SELECT')", (name,)).fetchone()[0]:
+                    raise Rejected(f"no read access to {name}")
+                cols = cur.execute(DESCRIBE_SQL, found).fetchall()
+        finally:
+            if own:
+                conn.close()
+    except Exception as e:
+        audit(cfg, describe=name, ok=False, error=f"{type(e).__name__}: {e}".strip()[:500])
+        raise
     audit(cfg, describe=name, ok=True)
     return [{"column": c, "type": t, "nullable": n == "YES", "masked": c.lower() in cfg.mask_columns} for c, t, n in cols]
 

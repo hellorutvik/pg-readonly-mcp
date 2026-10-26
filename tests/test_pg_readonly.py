@@ -5,7 +5,7 @@ import json, os, shutil, socket, subprocess, tempfile
 import psycopg
 import pytest
 
-from pg_readonly_mcp import Config, Rejected, check_sql, describe_table, first_word, list_tables, mask, run_query
+from pg_readonly_mcp import Config, Rejected, capped, check_sql, describe_table, first_word, list_tables, mask, run_query
 
 
 # ---------- unit ----------
@@ -27,6 +27,11 @@ def test_first_word_skips_comments():
     assert first_word("/* hi */ -- there\n  WITH a as (select 1) select 1") == "with"
 
 
+def test_capped_wraps_reads_and_leaves_explain():
+    assert capped("select 1;  ", 6) == "select * from (\nselect 1\n) as pgmcp_q limit 6"
+    assert capped("explain select 1", 6) == "explain select 1"
+
+
 def test_mask_keeps_last_four_only():
     assert mask("GB29NWBK60161331926819") == "****6819"
     assert mask("abc") == "****"
@@ -43,9 +48,13 @@ def _free_port():
 
 @pytest.fixture(scope="module")
 def pg():
-    initdb = shutil.which("initdb") or "/opt/homebrew/opt/postgresql@16/bin/initdb"
-    pg_ctl = shutil.which("pg_ctl") or "/opt/homebrew/opt/postgresql@16/bin/pg_ctl"
+    # initdb/pg_ctl are often not on PATH (Debian/Ubuntu keep them in the version's bindir).
+    bindir = subprocess.run(["pg_config", "--bindir"], capture_output=True, text=True).stdout.strip() if shutil.which("pg_config") else ""
+    initdb = shutil.which("initdb") or os.path.join(bindir, "initdb")
+    pg_ctl = shutil.which("pg_ctl") or os.path.join(bindir, "pg_ctl")
     if not os.path.exists(initdb):
+        if os.environ.get("PGMCP_REQUIRE_PG"):
+            pytest.fail("PGMCP_REQUIRE_PG is set but initdb was not found")
         pytest.skip("Postgres binaries not installed")
     root = tempfile.mkdtemp(prefix="pgmcp-")
     env = {**os.environ, "LC_ALL": "C", "LANG": "C"}  # postmaster refuses to start without a valid locale on macOS
@@ -111,13 +120,22 @@ def test_role_cannot_read_ungranted_tables(cfg):
         run_query(cfg, "select * from public.salaries")
 
 
-def test_writes_fail_even_for_a_superuser(cfg, pg):
-    # Bypass the keyword guard on purpose: the read-only transaction still stops the write.
+@pytest.mark.parametrize("sql", ["with x as (delete from orders returning 1) select count(*) from x",
+                                 "explain analyze delete from orders"])
+def test_writes_fail_even_for_a_superuser(cfg, pg, sql):
+    # Both pass the keyword guard on purpose. The CTE is stopped by the row-cap subquery,
+    # EXPLAIN (not wrapped) by the read-only transaction. Either way nothing is deleted.
     admin_cfg = Config(dsn=pg[1], audit_path=cfg.audit_path)
-    with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
-        run_query(admin_cfg, "with x as (delete from orders returning 1) select count(*) from x")
+    with pytest.raises(psycopg.Error):
+        run_query(admin_cfg, sql)
     with psycopg.connect(pg[1]) as c:
         assert c.execute("select count(*) from orders").fetchone()[0] == 120
+
+
+def test_read_only_transaction_on_its_own(cfg, pg):
+    admin_cfg = Config(dsn=pg[1], audit_path=cfg.audit_path)
+    with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
+        run_query(admin_cfg, "explain analyze delete from orders")
 
 
 @pytest.mark.parametrize("sql", ["select 1; select 2", "select 1; commit; delete from orders"])
@@ -143,3 +161,24 @@ def test_every_call_is_audited_with_user(cfg):
     assert [e["ok"] for e in log] == [True, False]
     assert all(e["user"] == "test.user@example" for e in log)
     assert "Rejected" in log[1]["error"]
+
+
+def test_row_cap_runs_in_the_database(cfg):
+    # Streams row by row, so only the server-side LIMIT keeps it under the 500 ms timeout.
+    r = run_query(cfg, "select generate_series(1, 200000000) as g")
+    assert r["row_count"] == 50 and r["truncated"] is True
+
+
+@pytest.mark.parametrize("sql", ["select 1;", "select 1 -- trailing note", "explain select 1", "values (1), (2)"])
+def test_common_query_shapes_still_run(cfg, sql):
+    assert run_query(cfg, sql)["row_count"] >= 1
+
+
+def test_describe_resolves_names_and_audits_rejections(cfg):
+    with pytest.raises(Rejected):
+        describe_table(cfg, "customer_orders")  # not on the role's search_path, so it must be schema-qualified
+    with pytest.raises(Rejected):
+        describe_table(cfg, "public.salaries")
+    log = _audit(cfg)
+    assert [e.get("describe") for e in log] == ["customer_orders", "public.salaries"]
+    assert not any(e["ok"] for e in log)
