@@ -1,0 +1,18 @@
+[project]
+name = "pg-readonly-mcp"
+version = "0.1.0"
+description = "Read-only PostgreSQL MCP server: Claude answers from your data and cannot change it"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = ["mcp>=2.0", "psycopg[binary]>=3.1"]
+
+[project.scripts]
+pg-readonly-mcp = "pg_readonly_mcp:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["pg_readonly_mcp"]
